@@ -13,7 +13,7 @@ on:
         default: '1900M'
   
   schedule:
-    - cron: '0 0 1 * *'  # Monthly rebuild
+    - cron: '0 0 1 * *'
 
 jobs:
   build-pdf:
@@ -35,9 +35,13 @@ jobs:
             texlive-latex-extra \
             texlive-fonts-recommended \
             texlive-science \
+            librsvg2-bin \
             python3-pip \
-            wkhtmltopdf \
             poppler-utils
+          
+          # Verify rsvg-convert is installed
+          which rsvg-convert || echo "⚠️ rsvg-convert not found"
+          rsvg-convert --version || echo "⚠️ rsvg-convert version check failed"
           
           pip3 install beautifulsoup4
 
@@ -56,6 +60,7 @@ jobs:
           for branch in "${!BOOKS[@]}"; do
             echo "========================================="
             echo "📚 Downloading: $branch"
+            echo "URL: ${BOOKS[$branch]}"
             echo "========================================="
             
             wget \
@@ -64,45 +69,70 @@ jobs:
               --adjust-extension \
               --page-requisites \
               --no-parent \
-              --wait=0.3 \
+              --wait=0.5 \
               --level=inf \
               --accept-regex "${BOOKS[$branch]}.*" \
-              --reject-regex '(\.pdf$|\.PDF$|\.zip$|\.epub$)' \
+              --reject-regex '(\.pdf$|\.PDF$|\.zip$|\.epub$|\.svgz$)' \
               --directory-prefix="./raw-html/$branch" \
               --no-verbose \
               --show-progress \
-              ${BOOKS[$branch]} || echo "⚠️ Some pages for $branch failed (continuing)"
+              "${BOOKS[$branch]}" || echo "⚠️ Some pages for $branch failed"
             
-            echo "✅ $branch download complete"
+            echo ""
+            echo "📊 Downloaded files for $branch:"
+            find "./raw-html/$branch" -name "*.html" -o -name "*.htm" | wc -l
+            du -sh "./raw-html/$branch"
             echo ""
           done
           
           echo "========================================="
-          echo "📊 Download Summary:"
+          echo "📊 TOTAL DOWNLOAD SUMMARY:"
           echo "========================================="
-          du -sh raw-html/*/
+          echo "Total HTML files: $(find raw-html -name '*.html' -o -name '*.htm' | wc -l)"
+          du -sh raw-html/
+
+      - name: 🔍 DEBUG: Show directory structure
+        run: |
+          echo "Raw HTML structure:"
+          find raw-html -type d | head -50
+          echo ""
+          echo "Sample HTML files:"
+          find raw-html -name "*.html" -o -name "*.htm" | head -20
 
       - name: 🔧 Process HTML to Clean Content
         run: |
           cat > clean_html.py << 'PYEOF'
-          import os, sys, glob
+          import os, sys, glob, re
           from bs4 import BeautifulSoup
           from pathlib import Path
+          
+          def find_html_files(root_dir):
+              """Recursively find ALL HTML files"""
+              html_files = []
+              for dirpath, dirnames, filenames in os.walk(root_dir):
+                  for filename in filenames:
+                      if filename.endswith(('.html', '.htm')):
+                          full_path = os.path.join(dirpath, filename)
+                          html_files.append(full_path)
+              return sorted(html_files)
           
           def extract_content(html_file):
               """Extract meaningful content from LibreTexts HTML"""
               try:
                   with open(html_file, 'r', encoding='utf-8', errors='ignore') as f:
                       soup = BeautifulSoup(f.read(), 'html.parser')
-              except:
+              except Exception as e:
+                  print(f"    ⚠️ Could not parse {html_file}: {e}")
                   return None, None
               
-              # Find main content area
+              # Find main content area - try multiple selectors
               content = (
                   soup.find('div', {'id': 'content'}) or 
                   soup.find('div', class_='mt-content-container') or
+                  soup.find('div', class_=re.compile('content')) or
                   soup.find('main') or 
                   soup.find('article') or
+                  soup.find('div', class_='entry-content') or
                   soup.find('body')
               )
               
@@ -110,168 +140,256 @@ jobs:
                   return None, None
               
               # Get title
-              title_tag = soup.find('h1') or soup.find('title')
+              title_tag = (
+                  soup.find('h1', class_='title') or
+                  soup.find('h1', class_='entry-title') or
+                  soup.find('h1') or 
+                  soup.find('title')
+              )
               title = title_tag.get_text().strip() if title_tag else os.path.basename(html_file)
               
               # Remove unwanted elements
               for tag in content.find_all(['script', 'style', 'nav', 'header', 'footer', 
-                                           'button', 'input', 'select', 'iframe']):
+                                           'button', 'input', 'select', 'iframe', 'svg']):
                   tag.decompose()
               
-              # Build clean markdown
-              md = []
+              # Remove empty paragraphs
+              for p in content.find_all('p'):
+                  if not p.get_text().strip():
+                      p.decompose()
               
-              for element in content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 
-                                               'p', 'li', 'img', 'table', 'pre', 'code']):
-                  if element.name.startswith('h'):
+              # Build clean markdown
+              md_lines = []
+              
+              # Process all content elements in order
+              for element in content.descendants:
+                  if element.name is None:
+                      continue
+                  
+                  if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
                       level = int(element.name[1])
-                      md.append(f"\n{'#' * level} {element.get_text().strip()}\n")
+                      text = element.get_text().strip()
+                      if text and len(text) > 2:
+                          md_lines.append(f"\n{'#' * level} {text}\n")
                   
                   elif element.name == 'p':
                       text = element.get_text().strip()
-                      if text:
-                          md.append(f"{text}\n")
+                      if text and len(text) > 5:
+                          md_lines.append(f"{text}\n")
                   
                   elif element.name == 'li':
-                      md.append(f"- {element.get_text().strip()}\n")
+                      text = element.get_text().strip()
+                      if text:
+                          md_lines.append(f"- {text}\n")
                   
                   elif element.name == 'img':
                       src = element.get('src', '')
-                      alt = element.get('alt', 'Image')
-                      if src:
-                          md.append(f"\n![{alt}]({src})\n")
+                      alt = element.get('alt', 'Figure')
+                      if src and not src.endswith('.svgz'):  # Skip SVGZ files
+                          md_lines.append(f"\n![{alt}]({src})\n\n")
                   
                   elif element.name == 'table':
-                      md.append("\n[Table - see original for details]\n")
+                      md_lines.append("\n> *[Table - see original for full details]*\n\n")
                   
                   elif element.name in ['pre', 'code']:
-                      md.append(f"\n```\n{element.get_text().strip()}\n```\n")
+                      code_text = element.get_text().strip()
+                      if code_text:
+                          md_lines.append(f"\n```\n{code_text}\n```\n")
               
-              return title, '\n'.join(md)
+              if not md_lines:
+                  return None, None
+              
+              return title, '\n'.join(md_lines)
           
-          # Process all books
+          # Main processing
           books_dir = 'raw-html'
           output_dir = 'processed-books'
+          os.makedirs(output_dir, exist_ok=True)
           
           for book_folder in sorted(os.listdir(books_dir)):
               book_path = os.path.join(books_dir, book_folder)
               if not os.path.isdir(book_path):
                   continue
               
-              print(f"\n{'='*50}")
-              print(f"Processing: {book_folder}")
-              print(f"{'='*50}")
+              print(f"\n{'='*60}")
+              print(f"📖 Processing: {book_folder}")
+              print(f"{'='*60}")
               
-              # Find all HTML files
-              html_files = []
-              for root, dirs, files in os.walk(book_path):
-                  for file in files:
-                      if file.endswith(('.html', '.htm')):
-                          html_files.append(os.path.join(root, file))
+              # Find ALL HTML files recursively
+              html_files = find_html_files(book_path)
+              total_files = len(html_files)
+              print(f"🔍 Found {total_files} HTML files")
               
-              html_files.sort()
-              print(f"Found {len(html_files)} pages")
+              if total_files == 0:
+                  print("⚠️ No HTML files found! Checking directory structure...")
+                  for root, dirs, files in os.walk(book_path):
+                      print(f"  {root}: {len(files)} files")
+                      for f in files[:5]:
+                          print(f"    - {f}")
+                  continue
               
               # Process each page
               book_content = []
+              success_count = 0
+              
               for idx, html_file in enumerate(html_files):
                   title, content = extract_content(html_file)
-                  if content:
-                      book_content.append(content)
                   
-                  if (idx + 1) % 100 == 0:
-                      print(f"  Progress: {idx + 1}/{len(html_files)}")
+                  if content:
+                      # Add section marker with title
+                      section_header = f"\n\n## {title}\n\n"
+                      book_content.append(section_header + content)
+                      success_count += 1
+                  
+                  # Progress indicator
+                  if (idx + 1) % 50 == 0 or idx == total_files - 1:
+                      print(f"  ⏳ Progress: {idx + 1}/{total_files} ({success_count} with content)")
               
-              # Save combined book
-              os.makedirs(output_dir, exist_ok=True)
-              output_file = os.path.join(output_dir, f"{book_folder}.md")
-              combined = '\n\n\\pagebreak\n\n'.join(book_content)
-              
-              with open(output_file, 'w', encoding='utf-8') as f:
-                  f.write(f"# {book_folder.replace('-', ' ')}\n\n")
-                  f.write(combined)
-              
-              print(f"✅ Saved: {output_file} ({len(book_content)} pages)")
+              # Save combined book content
+              if book_content:
+                  output_file = os.path.join(output_dir, f"{book_folder}.md")
+                  combined_content = '\n\n\\newpage\n\n'.join(book_content)
+                  
+                  with open(output_file, 'w', encoding='utf-8') as f:
+                      f.write(f"# {book_folder.replace('-', ' ')}\n\n")
+                      f.write(combined_content)
+                  
+                  file_size = os.path.getsize(output_file)
+                  print(f"✅ Saved: {output_file}")
+                  print(f"   📄 {success_count} pages extracted")
+                  print(f"   💾 {file_size / 1024 / 1024:.1f} MB")
+              else:
+                  print(f"❌ No content extracted for {book_folder}")
           
-          print(f"\n{'='*50}")
+          print(f"\n{'='*60}")
           print("✅ ALL BOOKS PROCESSED!")
+          print(f"{'='*60}")
+          
+          # Show summary
+          for f in sorted(os.listdir(output_dir)):
+              path = os.path.join(output_dir, f)
+              size = os.path.getsize(path)
+              print(f"  {f}: {size / 1024 / 1024:.1f} MB")
           PYEOF
           
           python3 clean_html.py
 
+      - name: 📊 Show Processing Results
+        run: |
+          echo "========================================="
+          echo "📊 PROCESSED BOOKS SUMMARY"
+          echo "========================================="
+          for f in processed-books/*.md; do
+            if [ -f "$f" ]; then
+              name=$(basename "$f" .md)
+              pages=$(grep -c "^## " "$f" 2>/dev/null || echo 0)
+              size=$(du -sh "$f" | cut -f1)
+              echo "📖 $name: $pages sections, $size"
+            fi
+          done
+
       - name: 📑 Build Table of Contents
         run: |
           cat > build_toc.py << 'PYEOF'
+          import os
+          
           def create_toc():
               toc = [
-                  "# 📚 Complete Chemistry Reference Library\n",
-                  "## Table of Contents\n",
-                  "*(Click any chapter or section to navigate)*\n\n"
+                  "# 📚 Complete Chemistry Reference Library\n\n",
+                  "## Table of Contents\n\n",
+                  "*(Click any chapter or section to jump directly to it)*\n\n",
+                  "\\newpage\n\n"
               ]
               
               book_configs = [
-                  ("01-Organic-Chemistry", "🧪 Organic Chemistry"),
-                  ("02-Inorganic-Chemistry", "⚗️ Inorganic Chemistry"),
-                  ("03-Physical-Chemistry", "🔬 Physical & Theoretical Chemistry"),
-                  ("04-Analytical-Chemistry", "📊 Analytical Chemistry"),
-                  ("05-General-Chemistry", "🧬 General Chemistry"),
+                  ("01-Organic-Chemistry", "🧪 Organic Chemistry", "Reactions, mechanisms, synthesis, spectroscopy"),
+                  ("02-Inorganic-Chemistry", "⚗️ Inorganic Chemistry", "Coordination chemistry, crystal field theory, organometallics"),
+                  ("03-Physical-Chemistry", "🔬 Physical & Theoretical Chemistry", "Thermodynamics, quantum mechanics, kinetics"),
+                  ("04-Analytical-Chemistry", "📊 Analytical Chemistry", "Spectroscopy, chromatography, electrochemistry"),
+                  ("05-General-Chemistry", "🧬 General Chemistry", "Fundamentals, stoichiometry, chemical bonding"),
               ]
               
               book_num = 0
-              for folder, title in book_configs:
+              for folder, title, description in book_configs:
                   book_num += 1
-                  toc.append(f"\n## {book_num}. {title}\n")
+                  toc.append(f"\n## {book_num}. {title}\n\n")
+                  toc.append(f"*{description}*\n\n")
                   
                   md_file = f"processed-books/{folder}.md"
-                  try:
-                      with open(md_file, 'r', encoding='utf-8') as f:
-                          for line in f:
-                              if line.startswith('## ') or line.startswith('### '):
-                                  depth = '  ' if line.startswith('### ') else ''
-                                  section = line.strip('#').strip()
-                                  toc.append(f"{depth}- [{section}](#{section.lower().replace(' ', '-')})\n")
-                  except FileNotFoundError:
-                      toc.append(f"*(Content pending)*\n")
+                  if os.path.exists(md_file):
+                      toc.append("### Sections in this book:\n\n")
+                      section_count = 0
+                      try:
+                          with open(md_file, 'r', encoding='utf-8') as f:
+                              for line in f:
+                                  if line.startswith('## ') and not line.startswith('### '):
+                                      section = line.strip('#').strip()
+                                      if section and len(section) > 3:
+                                          section_count += 1
+                                          anchor = section.lower().replace(' ', '-').replace('.', '')
+                                          toc.append(f"{section_count}. [{section}](#{anchor})\n")
+                      except Exception as e:
+                          toc.append(f"*(Error reading sections: {e})*\n")
+                      
+                      toc.append(f"\n*Total sections: {section_count}*\n")
+                  else:
+                      toc.append("*(Content pending download)*\n")
+                  
+                  toc.append("\n\\newpage\n")
               
-              toc.append("\n\\pagebreak\n")
               return ''.join(toc)
           
+          toc_content = create_toc()
           with open('TABLE_OF_CONTENTS.md', 'w', encoding='utf-8') as f:
-              f.write(create_toc())
+              f.write(toc_content)
           
           print("✅ Table of Contents created!")
+          print(f"   Size: {len(toc_content)} characters")
           PYEOF
           
           python3 build_toc.py
 
       - name: 📚 Combine into Master Document
         run: |
-          echo "# 📚 Complete Chemistry Reference Library" > chemistry-master.md
-          echo "" >> chemistry-master.md
-          echo "**5 Core Chemistry Textbooks • Full Offline Reference**" >> chemistry-master.md
-          echo "" >> chemistry-master.md
-          echo "\\pagebreak" >> chemistry-master.md
-          
-          # Add TOC
-          cat TABLE_OF_CONTENTS.md >> chemistry-master.md
-          echo "\\pagebreak" >> chemistry-master.md
-          
-          # Add each book
-          for book_file in processed-books/*.md; do
-            book_name=$(basename "$book_file" .md | sed 's/^[0-9]*-//')
-            echo "" >> chemistry-master.md
-            echo "# $(echo $book_name | sed 's/-/ /g')" >> chemistry-master.md
-            echo "\\pagebreak" >> chemistry-master.md
-            cat "$book_file" >> chemistry-master.md
-            echo "\\pagebreak" >> chemistry-master.md
-          done
+          {
+            echo "# 📚 Complete Chemistry Reference Library"
+            echo ""
+            echo "**5 Core Chemistry Textbooks | Full Offline Reference | Searchable PDF**"
+            echo ""
+            echo "\\newpage"
+            echo ""
+            cat TABLE_OF_CONTENTS.md
+            echo ""
+            echo "\\newpage"
+            echo ""
+            
+            for book_file in processed-books/*.md; do
+              if [ -f "$book_file" ]; then
+                book_name=$(basename "$book_file" .md | sed 's/^[0-9]*-//' | sed 's/-/ /g')
+                echo ""
+                echo "# $(echo $book_name | sed 's/\b\(.\)/\u\1/g')"
+                echo ""
+                echo "\\newpage"
+                echo ""
+                cat "$book_file"
+                echo ""
+                echo "\\newpage"
+                echo ""
+              fi
+            done
+          } > chemistry-master.md
           
           echo "✅ Master document created!"
-          wc -l chemistry-master.md
+          echo "   Size: $(wc -c < chemistry-master.md) bytes"
+          echo "   Lines: $(wc -l < chemistry-master.md)"
 
-      - name: 🎨 Create Header for PDF Styling
+      - name: 🎨 Configure LaTeX for PDF
         run: |
           cat > header.tex << 'LATEX'
+          % SVG support
+          \usepackage{svg}
+          \svgsetup{inkscape=false}
+          
           % Hyperlinks and PDF metadata
           \usepackage{hyperref}
           \hypersetup{
@@ -304,23 +422,32 @@ jobs:
           \usepackage{tocloft}
           \renewcommand{\cftsecfont}{\bfseries\Large}
           \renewcommand{\cftsubsecfont}{\bfseries}
-          \renewcommand{\cftsubsubsecfont}{\itshape}
           
-          % Image handling
+          % Image handling - skip SVGZ files
           \usepackage{graphicx}
-          \graphicspath{{./images/}}
-          \DeclareGraphicsExtensions{.png,.jpg,.pdf}
+          \DeclareGraphicsExtensions{.png,.jpg,.jpeg,.pdf}
           
           % Chemistry specific
           \usepackage[version=4]{mhchem}
           \usepackage{siunitx}
+          
+          % Fallback for missing images
+          \usepackage{etoolbox}
+          \let\Oldincludegraphics\includegraphics
+          \renewcommand{\includegraphics}[2][]{%
+            \IfFileExists{#2}{\Oldincludegraphics[#1]{#2}}{\fbox{Image not available: #2}}%
+          }
           LATEX
+          
+          echo "✅ LaTeX header configured"
 
       - name: 📄 Build Searchable PDF
         run: |
-          echo "🔄 Converting to PDF (this may take 30-60 minutes)..."
+          echo "🔄 Converting to PDF..."
+          echo "   Input: chemistry-master.md ($(wc -l < chemistry-master.md) lines)"
           
-          pandoc chemistry-master.md \
+          # Try building PDF
+          if pandoc chemistry-master.md \
             --from markdown \
             --to pdf \
             --pdf-engine=xelatex \
@@ -332,27 +459,49 @@ jobs:
             --metadata title="Complete Chemistry Reference Library" \
             --metadata author="LibreTexts Chemistry" \
             --metadata date="$(date +%Y-%m-%d)" \
-            --metadata lang="en-US" \
             --variable mainfont="DejaVu Serif" \
             --variable sansfont="DejaVu Sans" \
             --variable monofont="DejaVu Sans Mono" \
-            --variable mathfont="DejaVu Math TeX Gyre" \
             --variable geometry:margin=1in \
             --variable fontsize=11pt \
             --variable documentclass=book \
-            -o "Chemistry-Reference-Library.pdf"
+            -o "Chemistry-Reference-Library.pdf" 2> pandoc_errors.log; then
+            
+            echo "✅ PDF created successfully!"
+          else
+            echo "⚠️ PDF build had warnings, checking log..."
+            cat pandoc_errors.log
+            
+            # If PDF was still created despite errors
+            if [ -f "Chemistry-Reference-Library.pdf" ]; then
+              echo "✅ PDF exists despite warnings"
+            else
+              echo "❌ PDF build failed completely"
+              exit 1
+            fi
+          fi
           
-          echo "✅ PDF created!"
           ls -lh Chemistry-Reference-Library.pdf
 
-      - name: 📊 PDF Statistics
+      - name: 📊 Final PDF Statistics
         run: |
           echo "========================================="
           echo "📊 FINAL PDF STATISTICS"
           echo "========================================="
-          echo "File size: $(ls -lh Chemistry-Reference-Library.pdf | awk '{print $5}')"
-          echo "Pages: $(pdfinfo Chemistry-Reference-Library.pdf 2>/dev/null | grep Pages | awk '{print $2}' || echo 'Processing...')"
-          echo "PDF version: $(pdfinfo Chemistry-Reference-Library.pdf 2>/dev/null | grep 'PDF version' || echo '1.5+')"
+          echo ""
+          if [ -f Chemistry-Reference-Library.pdf ]; then
+            echo "✅ File size: $(ls -lh Chemistry-Reference-Library.pdf | awk '{print $5}')"
+            
+            if command -v pdfinfo &> /dev/null; then
+              echo "📄 Pages: $(pdfinfo Chemistry-Reference-Library.pdf | grep Pages | awk '{print $2}')"
+              echo "📐 PDF Version: $(pdfinfo Chemistry-Reference-Library.pdf | grep 'PDF version' | awk '{print $3}')"
+              echo "📏 Page size: $(pdfinfo Chemistry-Reference-Library.pdf | grep 'Page size' | awk '{$1=""; print $0}')"
+            fi
+          else
+            echo "❌ PDF not found!"
+            exit 1
+          fi
+          
           echo ""
           echo "📚 Included Textbooks:"
           echo "  1. 🧪 Organic Chemistry"
@@ -365,12 +514,11 @@ jobs:
           echo "  ✅ Interactive Table of Contents"
           echo "  ✅ Clickable internal links"
           echo "  ✅ Full-text search enabled"
-          echo "  ✅ Printer-friendly"
+          echo "  ✅ Printer-friendly formatting"
           echo "  ✅ Mobile/tablet compatible"
           echo "========================================="
 
-      - name: 📦 Split and Create Release
-        id: create_release
+      - name: 📦 Create Release
         uses: softprops/action-gh-release@v1
         with:
           name: "Chemistry Library v${{ github.run_number }} - $(date +%Y-%m-%d)"
@@ -382,44 +530,45 @@ jobs:
           body: |
             # 📚 Complete Chemistry Reference Library
             
-            ## ✨ Build #${{ github.run_number }} - $(date +%Y-%m-%d)
+            ## Build #${{ github.run_number }} - $(date +%Y-%m-%d)
             
             ### 📖 Included Textbooks:
-            | # | Branch | Description |
-            |---|--------|-------------|
+            | # | Branch | Topics |
+            |---|--------|--------|
             | 1 | 🧪 **Organic Chemistry** | Reactions, mechanisms, synthesis |
-            | 2 | ⚗️ **Inorganic Chemistry** | Coordination, crystal field, organometallics |
+            | 2 | ⚗️ **Inorganic Chemistry** | Coordination, crystal field theory |
             | 3 | 🔬 **Physical Chemistry** | Thermodynamics, quantum, kinetics |
             | 4 | 📊 **Analytical Chemistry** | Spectroscopy, chromatography |
-            | 5 | 🧬 **General Chemistry** | Fundamentals, stoichiometry, bonding |
+            | 5 | 🧬 **General Chemistry** | Fundamentals, stoichiometry |
             
             ### 🎯 PDF Features:
             - ✅ **Interactive Table of Contents** - click to navigate
             - 🔗 **Clickable internal cross-references**
             - 🔍 **Full-text search** (Ctrl+F / Cmd+F)
             - 📑 **PDF bookmarks panel** for quick access
-            - 📱 **Works on all devices**
+            - 📱 **Works on all devices** (phone, tablet, desktop)
             - 🖨️ **Print-ready formatting**
             
             ### 📊 Technical Details:
-            - **Estimated pages**: 6,000 - 7,500
-            - **File size**: ~300-500 MB
-            - **Format**: PDF with selectable text
             - **Source**: chem.libretexts.org
+            - **Format**: PDF with selectable text
+            - **License**: Open access educational content
             
             ---
-            *Built with ❤️ using GitHub Actions • Powered by LibreTexts*
+            *Built with GitHub Actions • Powered by LibreTexts Chemistry*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🧹 Cleanup Old Releases
+      - name: 🧹 Keep Only Latest 3 Releases
         run: |
-          # Keep only the 3 most recent releases
+          echo "Cleaning old releases..."
           gh release list --limit 100 --json tagName --jq '.[].tagName' | \
             grep "chemistry-" | tail -n +4 | \
             while read tag; do
-              echo "Deleting old release: $tag"
-              gh release delete "$tag" --yes
+              echo "  Deleting: $tag"
+              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
             done
+          echo "✅ Cleanup complete"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
