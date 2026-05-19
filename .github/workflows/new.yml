@@ -1,307 +1,118 @@
-name: Build Chemistry Reference PDF
+name: 🔄 Leecher - Download & Split
 
 on:
   workflow_dispatch:
+    inputs:
+      leech_url:
+        description: '🔗 Direct download URL'
+        required: true
+        type: string
+      leech_folder:
+        description: '📁 Custom folder name (leave empty to auto‑detect from URL)'
+        required: false
+        type: string
+        default: ''
+      leech_safe:
+        description: '🛡️ Safe mode (use custom name if provided, otherwise auto‑name)'
+        required: false
+        type: boolean
+        default: false
+      leech_split:
+        description: '✂️ Split size (e.g. 10M, 20M, 50M)'
+        required: false
+        type: string
+        default: '20M'
 
 permissions:
   contents: write
 
 jobs:
-  build-pdf:
+  leecher:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget pandoc texlive-xetex texlive-latex-recommended \
-            texlive-latex-extra texlive-fonts-recommended python3-pip
-          pip3 install beautifulsoup4 requests
-
-      - name: Download using Python scraper
-        run: |
-          python3 << 'PYEOF'
-          import requests
-          from bs4 import BeautifulSoup
-          import os
-          import time
-          import re
-          from urllib.parse import urljoin, urlparse
-          
-          base_urls = {
-              'Organic-Chemistry': 'https://chem.libretexts.org/Bookshelves/Organic_Chemistry',
-              'Inorganic-Chemistry': 'https://chem.libretexts.org/Bookshelves/Inorganic_Chemistry',
-              'Physical-Chemistry': 'https://chem.libretexts.org/Bookshelves/Physical_and_Theoretical_Chemistry',
-              'Analytical-Chemistry': 'https://chem.libretexts.org/Bookshelves/Analytical_Chemistry',
-              'General-Chemistry': 'https://chem.libretexts.org/Bookshelves/General_Chemistry',
-          }
-          
-          headers = {
-              'User-Agent': 'Mozilla/5.0 (compatible; ChemistryBot/1.0)'
-          }
-          
-          os.makedirs('html-books', exist_ok=True)
-          
-          for book_name, base_url in base_urls.items():
-              print(f"\n{'='*60}")
-              print(f"Downloading: {book_name}")
-              print(f"URL: {base_url}")
-              print(f"{'='*60}")
-              
-              book_dir = f'html-books/{book_name}'
-              os.makedirs(book_dir, exist_ok=True)
-              
-              visited = set()
-              to_visit = [(base_url, 'index.html')]
-              page_count = 0
-              
-              while to_visit and page_count < 500:  # Limit to 500 pages per book
-                  url, filename = to_visit.pop(0)
-                  
-                  if url in visited:
-                      continue
-                  
-                  try:
-                      print(f"  [{page_count+1}] Fetching: {url}")
-                      resp = requests.get(url, headers=headers, timeout=30)
-                      resp.raise_for_status()
-                      
-                      visited.add(url)
-                      
-                      # Save the HTML
-                      safe_name = filename.replace('/', '_').replace('\\', '_')
-                      if not safe_name.endswith('.html'):
-                          safe_name += '.html'
-                      
-                      filepath = os.path.join(book_dir, safe_name)
-                      with open(filepath, 'w', encoding='utf-8') as f:
-                          f.write(resp.text)
-                      
-                      page_count += 1
-                      
-                      # Parse and find more links
-                      soup = BeautifulSoup(resp.text, 'html.parser')
-                      
-                      # Find the main content area
-                      content = soup.find('div', id='content') or soup.find('main') or soup
-                      
-                      # Find all links
-                      for link in content.find_all('a', href=True):
-                          href = link['href']
-                          full_url = urljoin(url, href)
-                          
-                          # Only follow links within the same book
-                          if base_url in full_url and full_url not in visited:
-                              # Create a filename from the URL
-                              parsed = urlparse(full_url)
-                              link_filename = parsed.path.strip('/').replace('/', '_')
-                              if not link_filename:
-                                  link_filename = f'page_{len(visited)}'
-                              
-                              to_visit.append((full_url, link_filename))
-                      
-                      # Be polite
-                      time.sleep(0.5)
-                      
-                  except Exception as e:
-                      print(f"    Error: {e}")
-                      continue
-              
-              print(f"\n  Downloaded {page_count} pages for {book_name}")
-              print(f"  Directory size: {sum(os.path.getsize(os.path.join(book_dir, f)) for f in os.listdir(book_dir)) / 1024:.1f} KB")
-          
-          print(f"\n{'='*60}")
-          print("ALL DOWNLOADS COMPLETE!")
-          print(f"{'='*60}")
-          PYEOF
-
-      - name: Show download results
-        run: |
-          echo "========================================="
-          echo "DOWNLOAD RESULTS"
-          echo "========================================="
-          for dir in html-books/*/; do
-            name=$(basename "$dir")
-            count=$(ls "$dir"/*.html 2>/dev/null | wc -l)
-            size=$(du -sh "$dir" 2>/dev/null | cut -f1)
-            echo "$name: $count HTML files, $size"
-          done
-
-      - name: Extract content to Markdown
-        run: |
-          python3 << 'PYEOF'
-          import os, re
-          from bs4 import BeautifulSoup
-          
-          def clean_latex_commands(text):
-              """Remove or escape LaTeX commands that break pandoc"""
-              # Remove \newcommand and similar
-              text = re.sub(r'\\newcommand\s*\{[^}]*\}\s*\{[^}]*\}', '', text)
-              text = re.sub(r'\\renewcommand\s*\{[^}]*\}\s*\{[^}]*\}', '', text)
-              text = re.sub(r'\\DeclareMathOperator\s*\{[^}]*\}\s*\{[^}]*\}', '', text)
-              text = re.sub(r'\\span\b', 'span', text)
-              text = re.sub(r'\\colon\b', ':', text)
-              return text
-          
-          def extract_content(html_file):
-              try:
-                  with open(html_file, 'r', encoding='utf-8', errors='ignore') as f:
-                      soup = BeautifulSoup(f.read(), 'html.parser')
-              except:
-                  return None
-              
-              # Find content
-              content = (
-                  soup.find('div', id='content') or
-                  soup.find('div', class_='mt-content-container') or
-                  soup.find('main') or
-                  soup.find('article') or
-                  soup.find('body')
-              )
-              
-              if not content:
-                  return None
-              
-              # Get title
-              title = ''
-              h1 = soup.find('h1')
-              if h1:
-                  title = h1.get_text().strip()
-              
-              # Remove unwanted elements
-              for tag in content.find_all(['script', 'style', 'nav', 'footer', 'iframe', 'svg', 'button', 'input']):
-                  tag.decompose()
-              
-              # Extract text
-              paragraphs = []
-              for elem in content.find_all(['p', 'h2', 'h3', 'h4', 'li', 'td', 'th']):
-                  text = elem.get_text().strip()
-                  text = clean_latex_commands(text)
-                  
-                  if text and len(text) > 5:
-                      if elem.name.startswith('h'):
-                          level = int(elem.name[1])
-                          paragraphs.append('#' * level + ' ' + text)
-                      elif elem.name == 'li':
-                          paragraphs.append('- ' + text)
-                      else:
-                          paragraphs.append(text)
-                      
-                      paragraphs.append('')
-              
-              if not paragraphs:
-                  return None
-              
-              markdown = '\n'.join(paragraphs)
-              if title:
-                  markdown = '## ' + title + '\n\n' + markdown
-              
-              return markdown
-          
-          os.makedirs('processed-books', exist_ok=True)
-          
-          for book_dir in sorted(os.listdir('html-books')):
-              book_path = os.path.join('html-books', book_dir)
-              if not os.path.isdir(book_path):
-                  continue
-              
-              html_files = sorted([f for f in os.listdir(book_path) if f.endswith('.html')])
-              print(f"\n{book_dir}: {len(html_files)} files")
-              
-              all_content = []
-              for html_file in html_files:
-                  content = extract_content(os.path.join(book_path, html_file))
-                  if content and len(content) > 100:
-                      all_content.append(content)
-              
-              if all_content:
-                  output_file = os.path.join('processed-books', book_dir + '.md')
-                  with open(output_file, 'w', encoding='utf-8') as f:
-                      f.write('# ' + book_dir.replace('-', ' ') + '\n\n')
-                      f.write('\n\n\\newpage\n\n'.join(all_content))
-                  
-                  size_kb = os.path.getsize(output_file) / 1024
-                  print(f"  Saved: {len(all_content)} sections, {size_kb:.0f} KB")
-          
-          print("\nDone!")
-          PYEOF
-
-      - name: Build master document
-        run: |
-          echo "# Chemistry Reference Library" > chemistry-master.md
-          echo "" >> chemistry-master.md
-          
-          for book_file in processed-books/*.md; do
-            if [ -f "$book_file" ]; then
-              echo "" >> chemistry-master.md
-              cat "$book_file" >> chemistry-master.md
-              echo "" >> chemistry-master.md
-              echo "\\newpage" >> chemistry-master.md
-            fi
-          done
-          
-          echo "Master document: $(wc -l < chemistry-master.md) lines, $(wc -c < chemistry-master.md) bytes"
-
-      - name: Build PDF
-        run: |
-          echo "Building PDF..."
-          
-          # Filter out problematic LaTeX before conversion
-          python3 << 'PYEOF'
-          with open('chemistry-master.md', 'r', encoding='utf-8') as f:
-              content = f.read()
-          
-          # Remove common problematic LaTeX
-          import re
-          content = re.sub(r'\\newcommand\s*\{[^}]*\}\s*\{[^}]*\}', '', content)
-          content = re.sub(r'\\DeclareMathOperator\s*\{[^}]*\}\s*\{[^}]*\}', '', content)
-          content = re.sub(r'\\renewcommand\s*\{[^}]*\}\s*\{[^}]*\}', '', content)
-          content = re.sub(r'\\def\s*\\[a-zA-Z]+', '', content)
-          
-          with open('chemistry-clean.md', 'w', encoding='utf-8') as f:
-              f.write(content)
-          
-          print("Cleaned markdown saved")
-          PYEOF
-          
-          pandoc chemistry-clean.md \
-            -f markdown \
-            -t pdf \
-            --pdf-engine=xelatex \
-            --toc \
-            --toc-depth=3 \
-            -V mainfont="DejaVu Serif" \
-            -V geometry:margin=1in \
-            -o Chemistry-Library.pdf 2>&1 | grep -v "Warning:" || true
-          
-          if [ -f Chemistry-Library.pdf ] && [ -s Chemistry-Library.pdf ]; then
-            echo "SUCCESS! PDF created"
-            ls -lh Chemistry-Library.pdf
-          else
-            echo "PDF creation failed, checking errors..."
-            pandoc chemistry-clean.md -f markdown -t pdf --pdf-engine=xelatex -o test.pdf 2>&1 | tail -30
-            echo "Using artifact instead..."
-            cp chemistry-clean.md Chemistry-Library.md
-          fi
-
-      - name: Upload PDF artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          name: Chemistry-Library
-          path: |
-            Chemistry-Library.pdf
-            chemistry-clean.md
-          retention-days: 30
-
-      - name: Create Release
-        if: hashFiles('Chemistry-Library.pdf') != ''
-        uses: softprops/action-gh-release@v1
-        with:
-          name: "Chemistry Library - Build ${{ github.run_number }}"
-          tag_name: "chemistry-${{ github.run_number }}"
-          files: Chemistry-Library.pdf
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download and Split File
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zip
+          
+          URL="${{ inputs.leech_url }}"
+          FOLDER_INPUT="${{ inputs.leech_folder }}"
+          SAFE="${{ inputs.leech_safe }}"
+          SPLIT="${{ inputs.leech_split }}"
+          [ -z "$SPLIT" ] && SPLIT="20M"
+          
+          # Extract raw filename from URL (without query string)
+          RAW=$(basename "${URL%%\?*}" | sed 's/%20/ /g')
+          EXT="${RAW##*.}"
+          # If no extension found, treat whole name as base
+          if [ "$EXT" = "$RAW" ] || [ -z "$EXT" ]; then
+            BASE="$RAW"
+            EXT="file"
+          else
+            BASE="${RAW%.*}"
+          fi
+          
+          # Decide final folder name
+          if [ -n "$FOLDER_INPUT" ]; then
+            FOLDER="$FOLDER_INPUT"
+          else
+            FOLDER="$BASE"   # auto‑detected from URL
+          fi
+          
+          # Determine final file name inside the folder
+          if [ "$SAFE" = "true" ]; then
+            FINAL="${FOLDER}.${EXT}"
+          else
+            FINAL="${BASE}.${EXT}"
+          fi
+          
+          echo "📁 Folder: $FOLDER"
+          echo "📄 Final filename: $FINAL"
+          echo "🌐 Downloading: $URL"
+          
+          curl -L --fail --retry 5 -A "Mozilla/5.0" -o "temp_download" "$URL" || exit 1
+          
+          FILE_SIZE=$(du -h temp_download | cut -f1)
+          echo "Downloaded: $FILE_SIZE"
+          
+          mkdir -p wrap_dir
+          mv temp_download "wrap_dir/${FINAL}"
+          cd wrap_dir
+          zip -0 "../${FOLDER}.zip" "${FINAL}"
+          cd ..
+          
+          mkdir -p "save/leech/${FOLDER}"
+          split -b "$SPLIT" -d -a 3 "${FOLDER}.zip" "save/leech/${FOLDER}/chunk_"
+          
+          a=1
+          for i in save/leech/${FOLDER}/chunk_*; do
+            printf -v new "save/leech/${FOLDER}/${FOLDER}.zip.%03d" "$a"
+            mv -- "$i" "$new"
+            a=$((a+1))
+          done
+          
+          CHUNKS=$(ls save/leech/${FOLDER}/${FOLDER}.zip.* 2>/dev/null | wc -l)
+          echo "Created ${CHUNKS} chunks"
+          
+          rm -rf wrap_dir "${FOLDER}.zip"
+          echo "FOLDER=${FOLDER}" >> $GITHUB_ENV
+          echo "CHUNKS=${CHUNKS}" >> $GITHUB_ENV
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main --rebase || git pull origin master --rebase || true
+          git add save/leech/
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          git commit -m "🔄 Leech: ${FOLDER} (${CHUNKS} parts)"
+          git push
