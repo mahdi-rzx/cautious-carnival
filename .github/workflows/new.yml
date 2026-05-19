@@ -90,7 +90,7 @@ jobs:
           
           a=1
           for i in save/leech/${FOLDER}/chunk_*; do
-            printf -v new "save/leech/${FOLDER}/${FOLDER}.zip.%03d" "$a"
+            printf -v new "save/leech/%s/%s.zip.%03d" "$FOLDER" "$FOLDER" "$a"
             mv -- "$i" "$new"
             a=$((a+1))
           done
