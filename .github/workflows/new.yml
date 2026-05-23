@@ -18,10 +18,10 @@ on:
         type: string
         default: '20M'
       text_chunk_size:
-        description: '📝 Text chunk size for Base64 (KB, e.g. 25, 50, 100)'
+        description: '📝 Text chunk size for Base64 (KB, e.g. 25, 50, 100, 1000)'
         required: false
         type: string
-        default: '50'
+        default: '1000'
       use_base64_mode:
         description: '🔐 Convert to Base64 text chunks (bypass ISP raw domain block)'
         required: false
@@ -60,7 +60,7 @@ jobs:
           MAX_RETRIES="${{ inputs.max_retries }}"
           
           [ -z "$SPLIT" ] && SPLIT="20M"
-          [ -z "$TEXT_CHUNK_SIZE_KB" ] && TEXT_CHUNK_SIZE_KB="50"
+          [ -z "$TEXT_CHUNK_SIZE_KB" ] && TEXT_CHUNK_SIZE_KB="1000"
           [ -z "$MAX_RETRIES" ] && MAX_RETRIES=5
           
           # Convert KB to bytes for split
@@ -186,22 +186,25 @@ jobs:
           DIRECT_URL=$(extract_direct_link "$URL")
           echo "🎯 Target URL: $DIRECT_URL"
           
-          # Extract filename
-          RAW_NAME=$(basename "${DIRECT_URL%%\?*}" | sed 's/%20/ /g')
+          # Extract filename - handle URL encoded characters
+          RAW_NAME=$(basename "${DIRECT_URL%%\?*}" | sed 's/%20/ /g' | sed 's/%2F/\//g')
           if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "/" ] || [ "$RAW_NAME" = "$DIRECT_URL" ]; then
             RAW_NAME="downloaded_file"
           fi
+          
+          # Clean filename for filesystem
+          CLEAN_NAME=$(echo "$RAW_NAME" | sed 's/[\/:*?"<>|]/_/g')
           
           # Determine folder name
           if [ -n "$FOLDER_INPUT" ]; then
             FOLDER="$FOLDER_INPUT"
           else
-            FOLDER="${RAW_NAME%.*}"
+            FOLDER="${CLEAN_NAME%.*}"
             [ -z "$FOLDER" ] && FOLDER="download_$(date +%Y%m%d_%H%M%S)"
           fi
           
           echo "📁 Target folder: $FOLDER"
-          echo "📄 Base filename: $RAW_NAME"
+          echo "📄 Base filename: $CLEAN_NAME"
           
           # Attempt download
           if ! smart_download "$DIRECT_URL" "temp_download"; then
@@ -220,9 +223,9 @@ jobs:
           
           # Create ZIP archive of original
           mkdir -p "wrap_dir"
-          mv "temp_download" "wrap_dir/${RAW_NAME}"
+          mv "temp_download" "wrap_dir/${CLEAN_NAME}"
           cd wrap_dir
-          zip -0 "../${FOLDER}.zip" "${RAW_NAME}"
+          zip -0 "../${FOLDER}.zip" "${CLEAN_NAME}"
           cd ..
           
           if [ "$USE_BASE64" = "true" ]; then
@@ -250,9 +253,9 @@ jobs:
               # Create file with header
               {
                 echo "# Base64 chunk $a of $CHUNK_LIST"
-                echo "# Original file: ${RAW_NAME}"
+                echo "# Original file: ${CLEAN_NAME}"
                 echo "# Folder: ${FOLDER}"
-                echo "# To reconstruct: cat ${FOLDER}_part_*.txt | grep -v '^#' > ${FOLDER}.b64 && base64 -d ${FOLDER}.b64 > ${RAW_NAME}"
+                echo "# To reconstruct: cat ${FOLDER}_part_*.txt | grep -v '^#' > ${FOLDER}.b64 && base64 -d ${FOLDER}.b64 > ${CLEAN_NAME}"
                 echo "#---BEGIN BASE64 DATA---"
                 cat "$i"
                 echo "#---END BASE64 DATA---"
@@ -263,39 +266,35 @@ jobs:
               TOTAL_CHUNKS=$((TOTAL_CHUNKS + 1))
             done
             
-            # Create reconstruction script for Linux/Mac
-            cat > "save/leech/${FOLDER}/RECONSTRUCT.sh" << 'EOF'
-            #!/bin/bash
-            # Reconstruction script for Base64 chunks
-            echo "🔧 Reconstructing from Base64 chunks..."
-            cat text_chunks/*.txt | grep -v '^#' > temp_reconstruct.b64
-            echo "✅ Base64 data combined"
-            base64 -d temp_reconstruct.b64 > reconstructed_file
-            echo "✅ Binary file reconstructed"
-            ORIGINAL_NAME=$(head -1 text_chunks/*.txt | grep -oP 'Original file: \K.+')
-            if [ -n "$ORIGINAL_NAME" ]; then
-                mv reconstructed_file "$ORIGINAL_NAME"
-                echo "✅ Restored as: $ORIGINAL_NAME"
-            else
-                echo "⚠️  File reconstructed as 'reconstructed_file'"
-            fi
-            rm -f temp_reconstruct.b64
-            echo "🎉 Done!"
-            EOF
+            # Create reconstruction script for Linux/Mac using printf instead of heredoc
+            echo '#!/bin/bash' > "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo '# Reconstruction script for Base64 chunks' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'echo "🔧 Reconstructing from Base64 chunks..."' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'cat text_chunks/*.txt | grep -v "^#" > temp_reconstruct.b64' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'echo "✅ Base64 data combined"' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'base64 -d temp_reconstruct.b64 > reconstructed_file' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'echo "✅ Binary file reconstructed"' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'ORIGINAL_NAME=$(head -1 text_chunks/*.txt | grep -oP "Original file: \K.+")' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'if [ -n "$ORIGINAL_NAME" ]; then' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo '    mv reconstructed_file "$ORIGINAL_NAME"' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo '    echo "✅ Restored as: $ORIGINAL_NAME"' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'else' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo '    echo "⚠️  File reconstructed as '\''reconstructed_file'\''"' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'fi' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'rm -f temp_reconstruct.b64' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            echo 'echo "🎉 Done!"' >> "save/leech/${FOLDER}/RECONSTRUCT.sh"
             
             chmod +x "save/leech/${FOLDER}/RECONSTRUCT.sh"
             
             # Create reconstruction script for Windows
-            cat > "save/leech/${FOLDER}/RECONSTRUCT.bat" << 'EOF'
-            @echo off
-            echo Reconstructing from Base64 chunks...
-            type text_chunks\*.txt | findstr /v "^#" > temp_reconstruct.b64
-            echo Base64 data combined
-            certutil -decode temp_reconstruct.b64 reconstructed_file > nul
-            echo Binary file reconstructed
-            del temp_reconstruct.b64
-            echo Done!
-            EOF
+            echo '@echo off' > "save/leech/${FOLDER}/RECONSTRUCT.bat"
+            echo 'echo Reconstructing from Base64 chunks...' >> "save/leech/${FOLDER}/RECONSTRUCT.bat"
+            echo 'type text_chunks\*.txt | findstr /v "^#" > temp_reconstruct.b64' >> "save/leech/${FOLDER}/RECONSTRUCT.bat"
+            echo 'echo Base64 data combined' >> "save/leech/${FOLDER}/RECONSTRUCT.bat"
+            echo 'certutil -decode temp_reconstruct.b64 reconstructed_file > nul' >> "save/leech/${FOLDER}/RECONSTRUCT.bat"
+            echo 'echo Binary file reconstructed' >> "save/leech/${FOLDER}/RECONSTRUCT.bat"
+            echo 'del temp_reconstruct.b64' >> "save/leech/${FOLDER}/RECONSTRUCT.bat"
+            echo 'echo Done!' >> "save/leech/${FOLDER}/RECONSTRUCT.bat"
             
             echo "✅ Created ${TOTAL_CHUNKS} text chunks (${TEXT_CHUNK_SIZE_KB}KB each)"
             echo "📝 All chunks are viewable in GitHub blob pages"
