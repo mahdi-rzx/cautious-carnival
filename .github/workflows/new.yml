@@ -1,4 +1,4 @@
-name: 🔄 Smart Leecher - Download & Split
+name: 🔄 Smart Leecher - Download & Split (Base64 Edition)
 
 on:
   workflow_dispatch:
@@ -13,10 +13,20 @@ on:
         type: string
         default: ''
       leech_split:
-        description: '✂️ Split size (e.g. 10M, 20M, 50M)'
+        description: '✂️ Split size for raw chunks (e.g. 10M, 20M, 50M)'
         required: false
         type: string
         default: '20M'
+      text_chunk_size:
+        description: '📝 Text chunk size for Base64 (KB, e.g. 25, 50, 100) - smaller = more files but easier to view in blob'
+        required: false
+        type: string
+        default: '50'
+      use_base64_mode:
+        description: '🔐 Convert to Base64 text chunks (bypass ISP raw domain block)'
+        required: false
+        type: boolean
+        default: true
       max_retries:
         description: '🔄 Max retries on failure'
         required: false
@@ -38,16 +48,23 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq zip wget curl html2text jq
+          sudo apt-get install -y -qq zip wget curl html2text jq xxd
 
-      - name: Smart Download
+      - name: Smart Download with Base64 Conversion
         run: |
           URL="${{ inputs.leech_url }}"
           FOLDER_INPUT="${{ inputs.leech_folder }}"
           SPLIT="${{ inputs.leech_split }}"
+          TEXT_CHUNK_SIZE_KB="${{ inputs.text_chunk_size }}"
+          USE_BASE64="${{ inputs.use_base64_mode }}"
           MAX_RETRIES="${{ inputs.max_retries }}"
+          
           [ -z "$SPLIT" ] && SPLIT="20M"
+          [ -z "$TEXT_CHUNK_SIZE_KB" ] && TEXT_CHUNK_SIZE_KB="50"
           [ -z "$MAX_RETRIES" ] && MAX_RETRIES=5
+          
+          # Convert KB to bytes for split
+          TEXT_CHUNK_BYTES=$((TEXT_CHUNK_SIZE_KB * 1024))
           
           # Function to extract direct links from various services
           extract_direct_link() {
@@ -74,18 +91,6 @@ jobs:
               return 0
             fi
             
-            # Mega.nz (requires megatools, limited)
-            if echo "$url" | grep -q "mega.nz"; then
-              echo "MEGA:REQUIRES_TOKEN"  # Special flag
-              return 0
-            fi
-            
-            # MediaFire
-            if echo "$url" | grep -q "mediafire.com"; then
-              echo "MEDIAFIRE:NEEDS_HTML_PARSING"
-              return 0
-            fi
-            
             # Return original if no pattern matches
             echo "$url"
             return 0
@@ -98,7 +103,6 @@ jobs:
             local retries=0
             local temp_cookies=$(mktemp)
             
-            # Common user agents to rotate
             USER_AGENTS=(
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
               "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
@@ -110,7 +114,6 @@ jobs:
               
               echo "Attempt $((retries+1))/$MAX_RETRIES - User-Agent: ${UA:0:50}..."
               
-              # Use curl with comprehensive options
               curl -L --fail --progress-bar \
                 -A "$UA" \
                 -b "$temp_cookies" \
@@ -123,31 +126,23 @@ jobs:
                 --referer "$(echo "$url" | grep -oP '^https?://[^/]+')" \
                 -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
                 -H "Accept-Language: en-US,en;q=0.5" \
-                -H "Accept-Encoding: gzip, deflate, br" \
                 -H "DNT: 1" \
-                -H "Connection: keep-alive" \
-                -H "Upgrade-Insecure-Requests: 1" \
                 -o "$output" \
                 -w "%{http_code}" \
                 "$url" > "${output}.code" 2>&1
               
               HTTP_CODE=$(cat "${output}.code" 2>/dev/null | tail -1)
               
-              # Check for common issues
               if [ -f "$output" ] && [ -s "$output" ]; then
-                # Check if we got HTML instead of binary (likely a challenge page)
                 if file "$output" | grep -q "HTML"; then
                   echo "⚠️  Got HTML response (possible captcha/challenge page)"
                   
-                  # Check for Cloudflare
                   if grep -q "cf-challenge\|cloudflare\|attention required" "$output" 2>/dev/null; then
                     echo "❌ Cloudflare challenge detected - cannot bypass automatically"
-                    echo "💡 Suggestion: Use a direct link or download manually"
                     rm -f "$output"
                     return 1
                   fi
                   
-                  # Try to extract any actual download link from HTML
                   echo "🔍 Attempting to extract download link from HTML..."
                   EXTRACTED_URL=$(grep -oP '(?:href|src)="(https?://[^"]+\.(?:zip|rar|7z|exe|msi|pdf|jpg|png|mp4|mkv|torrent)[^"]*)"' "$output" | head -1 | sed 's/.*"//')
                   
@@ -157,14 +152,12 @@ jobs:
                     return $?
                   fi
                 else
-                  # Success - got binary content
                   echo "✅ Download successful"
                   rm -f "$temp_cookies" "${output}.code"
                   return 0
                 fi
               fi
               
-              # Check HTTP code
               if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "206" ]; then
                 if [ -f "$output" ] && [ -s "$output" ]; then
                   echo "✅ Download successful (HTTP $HTTP_CODE)"
@@ -177,7 +170,7 @@ jobs:
               retries=$((retries+1))
               
               if [ $retries -lt $MAX_RETRIES ]; then
-                sleep $((retries * 5))  # Progressive delay
+                sleep $((retries * 5))
               fi
             done
             
@@ -188,21 +181,13 @@ jobs:
           
           # Main logic
           echo "🔍 Original URL: $URL"
+          echo "🔐 Base64 Mode: $USE_BASE64"
           
-          # Extract direct link if possible
           DIRECT_URL=$(extract_direct_link "$URL")
           echo "🎯 Target URL: $DIRECT_URL"
           
-          # For MEGA.nz special handling
-          if echo "$DIRECT_URL" | grep -q "^MEGA:"; then
-            echo "❌ MEGA.nz requires authentication token and megatools"
-            echo "💡 Please use a direct download link instead"
-            exit 1
-          fi
-          
-          # Extract filename from URL or HTML
+          # Extract filename
           RAW_NAME=$(basename "${DIRECT_URL%%\?*}" | sed 's/%20/ /g')
-          
           if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "/" ] || [ "$RAW_NAME" = "$DIRECT_URL" ]; then
             RAW_NAME="downloaded_file"
           fi
@@ -224,7 +209,6 @@ jobs:
             exit 1
           fi
           
-          # Verify download
           if [ ! -f "temp_download" ] || [ ! -s "temp_download" ]; then
             echo "❌ Downloaded file is empty or missing"
             exit 1
@@ -234,33 +218,118 @@ jobs:
           FILE_TYPE=$(file -b temp_download | cut -d, -f1)
           echo "✅ Downloaded: $FILE_SIZE ($FILE_TYPE)"
           
-          # Create ZIP archive
+          # Create ZIP archive of original
           mkdir -p "wrap_dir"
           mv "temp_download" "wrap_dir/${RAW_NAME}"
           cd wrap_dir
           zip -0 "../${FOLDER}.zip" "${RAW_NAME}"
           cd ..
           
-          # Split into chunks
-          mkdir -p "save/leech/${FOLDER}"
-          split -b "$SPLIT" -d -a 3 "${FOLDER}.zip" "save/leech/${FOLDER}/chunk_"
-          
-          a=1
-          for i in save/leech/${FOLDER}/chunk_*; do
-            printf -v new "save/leech/%s/%s.zip.%03d" "$FOLDER" "$FOLDER" "$a"
-            mv -- "$i" "$new"
-            a=$((a+1))
-          done
-          
-          CHUNKS=$(ls save/leech/${FOLDER}/${FOLDER}.zip.* 2>/dev/null | wc -l)
-          echo "✅ Created ${CHUNKS} chunks (${SPLIT} each)"
-          
-          # Cleanup
-          rm -rf wrap_dir "${FOLDER}.zip"
+          if [ "$USE_BASE64" = "true" ]; then
+            echo "🔄 Converting to Base64 text chunks for ISP bypass..."
+            
+            # Convert ZIP to Base64
+            base64 -w 0 "${FOLDER}.zip" > "${FOLDER}.b64"
+            B64_SIZE=$(du -h "${FOLDER}.b64" | cut -f1)
+            echo "📊 Base64 size: $B64_SIZE (original: $FILE_SIZE)"
+            
+            # Create directory for text chunks
+            mkdir -p "save/leech/${FOLDER}/text_chunks"
+            
+            # Split Base64 into small text files (viewable in blob)
+            split -b "$TEXT_CHUNK_BYTES" -d -a 4 "${FOLDER}.b64" "save/leech/${FOLDER}/text_chunks/chunk_"
+            
+            # Rename to .txt files with proper naming
+            a=1
+            TOTAL_CHUNKS=0
+            for i in save/leech/${FOLDER}/text_chunks/chunk_*; do
+              printf -v new "save/leech/%s/text_chunks/%s_part_%04d.txt" "$FOLDER" "$FOLDER" "$a"
+              # Add metadata header to each chunk for easier reconstruction
+              {
+                echo "# Base64 chunk $a of $(ls save/leech/${FOLDER}/text_chunks/chunk_* | wc -l)"
+                echo "# Original file: ${RAW_NAME}"
+                echo "# Folder: ${FOLDER}"
+                echo "# To reconstruct: cat ${FOLDER}_part_*.txt | grep -v '^#' > ${FOLDER}.b64 && base64 -d ${FOLDER}.b64 > ${RAW_NAME}"
+                echo "#---BEGIN BASE64 DATA---"
+                cat "$i"
+                echo "#---END BASE64 DATA---"
+              } > "$new"
+              rm -f "$i"
+              a=$((a+1))
+              TOTAL_CHUNKS=$((TOTAL_CHUNKS + 1))
+            done
+            
+            # Create a reconstruction script
+            cat > "save/leech/${FOLDER}/RECONSTRUCT.sh" << 'EOF'
+#!/bin/bash
+# Reconstruction script for Base64 chunks
+# Run this in the directory containing the text_chunks folder
+
+echo "🔧 Reconstructing from Base64 chunks..."
+cat text_chunks/*.txt | grep -v '^#' > temp_reconstruct.b64
+echo "✅ Base64 data combined"
+
+base64 -d temp_reconstruct.b64 > reconstructed_file
+echo "✅ Binary file reconstructed"
+
+# Try to determine original name
+ORIGINAL_NAME=$(head -1 text_chunks/*.txt | grep -oP 'Original file: \K.+')
+if [ -n "$ORIGINAL_NAME" ]; then
+    mv reconstructed_file "$ORIGINAL_NAME"
+    echo "✅ Restored as: $ORIGINAL_NAME"
+else
+    echo "⚠️  File reconstructed as 'reconstructed_file'"
+fi
+
+rm -f temp_reconstruct.b64
+echo "🎉 Done!"
+EOF
+            
+            chmod +x "save/leech/${FOLDER}/RECONSTRUCT.sh"
+            
+            # Also create a Windows batch file
+            cat > "save/leech/${FOLDER}/RECONSTRUCT.bat" << 'EOF'
+@echo off
+REM Reconstruction script for Windows
+echo Reconstructing from Base64 chunks...
+type text_chunks\*.txt | findstr /v "^#" > temp_reconstruct.b64
+echo Base64 data combined
+certutil -decode temp_reconstruct.b64 reconstructed_file > nul
+echo Binary file reconstructed
+del temp_reconstruct.b64
+echo Done!
+EOF
+            
+            echo "✅ Created ${TOTAL_CHUNKS} text chunks (${TEXT_CHUNK_SIZE_KB}KB each)"
+            echo "📝 All chunks are viewable in GitHub blob pages"
+            echo "🛠️  Reconstruction scripts: RECONSTRUCT.sh (Linux/Mac) and RECONSTRUCT.bat (Windows)"
+            
+            # Cleanup
+            rm -f "${FOLDER}.b64" "${FOLDER}.zip"
+            rm -rf wrap_dir
+            
+          else
+            # Original mode: split ZIP directly
+            mkdir -p "save/leech/${FOLDER}"
+            split -b "$SPLIT" -d -a 3 "${FOLDER}.zip" "save/leech/${FOLDER}/chunk_"
+            
+            a=1
+            for i in save/leech/${FOLDER}/chunk_*; do
+              printf -v new "save/leech/%s/%s.zip.%03d" "$FOLDER" "$FOLDER" "$a"
+              mv -- "$i" "$new"
+              a=$((a+1))
+            done
+            
+            CHUNKS=$((a-1))
+            echo "✅ Created ${CHUNKS} chunks (${SPLIT} each)"
+            
+            rm -rf wrap_dir "${FOLDER}.zip"
+          fi
           
           # Export for commit message
           echo "FOLDER=${FOLDER}" >> $GITHUB_ENV
-          echo "CHUNKS=${CHUNKS}" >> $GITHUB_ENV
+          echo "TOTAL_CHUNKS=${TOTAL_CHUNKS:-$CHUNKS}" >> $GITHUB_ENV
+          echo "USE_BASE64=${USE_BASE64}" >> $GITHUB_ENV
           echo "ORIGINAL_URL=${URL}" >> $GITHUB_ENV
 
       - name: Commit and Push
@@ -275,5 +344,9 @@ jobs:
             exit 0
           fi
           
-          git commit -m "🔄 Smart Leech: ${FOLDER} (${CHUNKS} parts from ${ORIGINAL_URL:0:60})"
+          if [ "$USE_BASE64" = "true" ]; then
+            git commit -m "🔄 Smart Leech (Base64 mode): ${FOLDER} (${TOTAL_CHUNKS} text chunks - ISP bypass enabled)"
+          else
+            git commit -m "🔄 Smart Leech: ${FOLDER} (${TOTAL_CHUNKS} parts from ${ORIGINAL_URL:0:60})"
+          fi
           git push
