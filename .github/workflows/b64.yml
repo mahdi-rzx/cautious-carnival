@@ -1,0 +1,109 @@
+name: 🔄 Leecher - Base64 Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      leech_url:
+        description: '🔗 Direct download URL'
+        required: true
+        type: string
+      leech_folder:
+        description: '📁 Custom folder name (leave empty to auto-detect from URL)'
+        required: false
+        type: string
+        default: ''
+      leech_split:
+        description: '✂️ Split size (e.g. 10M, 20M, 50M)'
+        required: false
+        type: string
+        default: '20M'
+
+permissions:
+  contents: write
+
+jobs:
+  leecher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download and Create Base64 Parts
+        run: |
+          URL="${{ inputs.leech_url }}"
+          FOLDER_INPUT="${{ inputs.leech_folder }}"
+          SPLIT="${{ inputs.leech_split }}"
+          [ -z "$SPLIT" ] && SPLIT="20M"
+          
+          # Extract filename from URL
+          RAW=$(basename "${URL%%\?*}" | sed 's/%20/ /g')
+          EXT="${RAW##*.}"
+          if [ "$EXT" = "$RAW" ] || [ -z "$EXT" ]; then
+            BASE="$RAW"
+            EXT="file"
+          else
+            BASE="${RAW%.*}"
+          fi
+          
+          # Set folder name
+          if [ -n "$FOLDER_INPUT" ]; then
+            FOLDER="$FOLDER_INPUT"
+          else
+            FOLDER="$BASE"
+          fi
+          
+          FINAL="${BASE}.${EXT}"
+          
+          echo "📁 Folder: $FOLDER"
+          echo "📄 File: $FINAL"
+          echo "🌐 Downloading: $URL"
+          
+          # Download file
+          curl -L --fail --retry 5 -A "Mozilla/5.0" -o "temp_download" "$URL" || exit 1
+          
+          FILE_SIZE=$(du -h temp_download | cut -f1)
+          echo "✅ Downloaded: $FILE_SIZE"
+          
+          # Create zip
+          mkdir -p wrap_dir
+          mv temp_download "wrap_dir/${FINAL}"
+          cd wrap_dir
+          zip -0 "../${FOLDER}.zip" "${FINAL}"
+          cd ..
+          
+          # Split into chunks
+          mkdir -p "save/leech/${FOLDER}/b64"
+          split -b "$SPLIT" -d -a 3 "${FOLDER}.zip" "temp_chunk_"
+          
+          # Convert each chunk to base64
+          a=1
+          for chunk in temp_chunk_*; do
+            base64 -w 0 "$chunk" > "save/leech/${FOLDER}/b64/${FOLDER}.b64.$(printf "%03d" $a)"
+            a=$((a+1))
+          done
+          
+          CHUNKS=$((a - 1))
+          echo "✅ Created ${CHUNKS} base64 chunks"
+          
+          # Cleanup
+          rm -rf wrap_dir "${FOLDER}.zip" temp_chunk_*
+          
+          echo "FOLDER=${FOLDER}" >> $GITHUB_ENV
+          echo "CHUNKS=${CHUNKS}" >> $GITHUB_ENV
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main --rebase || git pull origin master --rebase || true
+          git add save/leech/
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          git commit -m "🔄 Leech: ${FOLDER} (${CHUNKS} base64 parts)"
+          git push
